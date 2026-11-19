@@ -697,7 +697,7 @@ def _resolve_device(device: int | str) -> int:
     return results[0]["id"]
 
 
-@mcp.tool
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
 def netbox_create_inventory_item(
     device: int | str,
     name: str,
@@ -745,7 +745,7 @@ def netbox_create_inventory_item(
     return netbox.create(endpoint, data)
 
 
-@mcp.tool
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
 def netbox_create_journal_entry(
     object_type: str,
     object_id: int | str,
@@ -785,7 +785,7 @@ def netbox_create_journal_entry(
     return netbox.create(endpoint, data)
 
 
-@mcp.tool
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
 def netbox_create_object(object_type: str, data: dict):
     """
     Create a NetBox object of a whitelisted type. For the two common part-history objects
@@ -811,7 +811,8 @@ def netbox_create_object(object_type: str, data: dict):
     return netbox.create(endpoint, data)
 
 
-@mcp.tool
+# PATCH overwrites existing field values, so it is marked destructive.
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True})
 def netbox_update_object(object_type: str, object_id: int, data: dict):
     """
     PATCH specific fields of an existing NetBox object. Whitelisted object types only.
@@ -838,7 +839,7 @@ def netbox_update_object(object_type: str, object_id: int, data: dict):
     return netbox.update(endpoint, int(object_id), data)
 
 
-@mcp.tool
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
 def netbox_upload_image_attachment(
     object_type: str,
     object_id: int | str,
