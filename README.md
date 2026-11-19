@@ -1,5 +1,10 @@
 # NetBox MCP Server
 
+> **Fork notice.** This is a fork of [netboxlabs/netbox-mcp-server](https://github.com/netboxlabs/netbox-mcp-server)
+> (Apache 2.0). It adds a small set of **whitelisted write tools** for documenting physical
+> servers and tracking part history. Upstream remains read-only; everything else is unchanged.
+> See [Changes from upstream](#changes-from-upstream).
+
 > **⚠️ Breaking Change in v1.0.0**: The project structure has changed.
 > If upgrading from v0.1.0, update your configuration:
 > - Change `uv run server.py` to `uv run netbox-mcp-server`
@@ -402,6 +407,31 @@ If discovery fails for any reason (network error, insufficient permissions, unsu
 Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) before proposing new features. We encourage filing an issue for discussion first to confirm scope fit.
 
 If your use case needs capabilities outside this project's scope, forking under Apache 2.0 is an actively supported path.
+
+## Changes from upstream
+
+This fork adds the following tools in `src/netbox_mcp_server/server.py` (block
+"WHITELISTED WRITE TOOLS"), an `upload()` method in `src/netbox_mcp_server/netbox_client.py`,
+and `tests/test_image_attachment.py`.
+
+| Tool | Description |
+|------|-------------|
+| netbox_create_inventory_item | Record a physical part (slot, part number, serial) fitted to a device |
+| netbox_create_journal_entry | Add a dated journal entry to an object (e.g. a part swap event) |
+| netbox_create_object | Create an object of a whitelisted type |
+| netbox_update_object | PATCH fields of an object of a whitelisted type |
+| netbox_upload_image_attachment | Attach a local image (png/jpg/gif/webp, max 25 MB) to a device, rack, location or site |
+
+Guardrails:
+
+- **Whitelist only.** Writes are limited to the types in `WRITE_ALLOWED_CREATE` and
+  `WRITE_ALLOWED_UPDATE`; any other `object_type` is refused before a request is sent.
+- **No delete and no bulk tools.**
+- **Image uploads** accept only real image files (extension and magic bytes are checked),
+  so the tool cannot be used to send arbitrary local files to NetBox.
+- **Token scope.** The write tools need a NetBox token with write permission. Grant it
+  only on the whitelisted object types; with a read-only token the server behaves like
+  upstream and write calls fail with 403.
 
 ## License
 

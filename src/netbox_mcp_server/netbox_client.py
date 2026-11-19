@@ -250,6 +250,43 @@ class NetBoxRestClient(NetBoxClientBase):
         response.raise_for_status()
         return response.json()
 
+    def upload(self, endpoint: str, data: dict[str, Any], files: dict[str, Any]) -> dict[str, Any]:
+        """
+        Create an object from a multipart/form-data POST (e.g. an image attachment).
+
+        The session pins Content-Type to application/json, which would override the
+        multipart boundary httpx generates, so this request is built with only the
+        auth and accept headers.
+
+        Args:
+            endpoint: The API endpoint (e.g., 'extras/image-attachments')
+            data: Form fields
+            files: httpx files mapping, e.g. {"image": (filename, fileobj, mime)}
+
+        Returns:
+            The created object as a dict
+
+        Raises:
+            httpx.HTTPStatusError: If the request fails
+        """
+        url = self._build_url(endpoint)
+        headers = {
+            "Authorization": self.session.headers["Authorization"],
+            "Accept": "application/json",
+        }
+        response = httpx.post(
+            url, headers=headers, data=data, files=files, verify=self.verify_ssl, timeout=60
+        )
+        if response.is_error:
+            # The field-level reason (e.g. {"name": ["Ensure this field has no more than
+            # 50 characters."]}) is in the body; without it a 400 is undiagnosable.
+            raise httpx.HTTPStatusError(
+                f"{response.status_code} from {url}: {response.text[:500]}",
+                request=response.request,
+                response=response,
+            )
+        return response.json()
+
     def update(self, endpoint: str, id: int, data: dict[str, Any]) -> dict[str, Any]:
         """
         Update an existing object in NetBox via the REST API.
