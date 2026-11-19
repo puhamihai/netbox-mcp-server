@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import hmac
 import logging
+import os
 import sys
 from typing import Annotated, Any
 from urllib.parse import urlsplit
@@ -599,6 +600,316 @@ def netbox_search_objects(
             continue
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# WHITELISTED WRITE TOOLS (fork addition) — physical asset and part-history tracking.
+#
+# Upstream is read-only by design and points users at forking (Apache 2.0) for
+# anything more. This fork adds a narrow set of create/update tools for one
+# workflow: documenting physical servers and recording which part was fitted to
+# which server, and when. There is deliberately NO delete and NO bulk tool: the
+# workflow never needs them, and their absence is a safety property on a
+# production DCIM that an LLM can drive.
+#
+# Writes require a NetBox API token with write permission on the whitelisted
+# object types. Scope the token to exactly those permissions.
+# ---------------------------------------------------------------------------
+
+# Only these object types may be written. Anything else is refused, so a
+# mistaken object_type cannot touch prefixes, circuits, sites, etc.
+WRITE_ALLOWED_CREATE = {
+    "dcim.inventoryitem",
+    "extras.journalentry",
+    # Part vendors attribute a DIMM/disk to its real maker (Samsung, Hynix, Micron,
+    # Seagate…) rather than to the server's vendor. Name + slug only.
+    "dcim.manufacturer",
+    # Physical servers missing from NetBox must be creatable, otherwise their part
+    # history has nothing to hang off. Decide presence on the hardware serial / service
+    # tag, not the hostname: inventories often hold devices named by serial or by IP,
+    # and name-only matching creates duplicates.
+    "dcim.device",
+    # Document physical servers fully: interfaces + MACs, OOB/primary IPs, cables to
+    # the switches (e.g. from BMC LLDP data) and the racks they sit in. Create only.
+    # Check for an existing IP/interface/cable before creating, so nothing is duplicated.
+    "dcim.interface",
+    "dcim.macaddress",
+    "ipam.ipaddress",
+    "dcim.cable",
+    "dcim.rack",
+    # Tags mark lifecycle state, e.g. a decommission cooling period or a released spare.
+    "extras.tag",
+    # Blade chassis need their bays so sleds can be installed in them (parent_device),
+    # and site photos (service tag, front, rear, modules) belong on the device.
+    # Image attachments are only created through netbox_upload_image_attachment.
+    "dcim.devicebay",
+    "extras.imageattachment",
+}
+WRITE_ALLOWED_UPDATE = {
+    "dcim.inventoryitem",
+    "extras.journalentry",
+    "dcim.device",
+    # Set an interface's primary MAC, and correct an IP's assignment.
+    "dcim.interface",
+    "ipam.ipaddress",
+    # Install / move a sled in a chassis bay (installed_device).
+    "dcim.devicebay",
+}
+
+# Image attachments: what they may hang off, and which files may be sent. The upload
+# reads a local file, so it is limited to real images (extension AND magic bytes) to
+# keep it from becoming a way to ship arbitrary local files into NetBox.
+IMAGE_ATTACH_OBJECT_TYPES = {"dcim.device", "dcim.rack", "dcim.location", "dcim.site"}
+IMAGE_MAX_BYTES = 25 * 1024 * 1024
+IMAGE_NAME_MAX = 50
+IMAGE_TYPES = {
+    ".png": ("image/png", (b"\x89PNG\r\n\x1a\n",)),
+    ".jpg": ("image/jpeg", (b"\xff\xd8\xff",)),
+    ".jpeg": ("image/jpeg", (b"\xff\xd8\xff",)),
+    ".gif": ("image/gif", (b"GIF87a", b"GIF89a")),
+    ".webp": ("image/webp", (b"RIFF",)),
+}
+
+
+def _assert_writable(object_type: str, allowed: set[str], verb: str) -> None:
+    if object_type not in NETBOX_OBJECT_TYPES:
+        raise ValueError(f"Unknown object_type '{object_type}'.")
+    if object_type not in allowed:
+        raise ValueError(
+            f"Refusing to {verb} '{object_type}'. This server only permits {verb} on: "
+            f"{', '.join(sorted(allowed))}. Widen WRITE_ALLOWED_* in server.py only with "
+            f"a deliberate decision — this whitelist is the guardrail."
+        )
+
+
+def _resolve_device(device: int | str) -> int:
+    """Accept a device id or an exact device name and return the id."""
+    if isinstance(device, int):
+        return device
+    if str(device).isdigit():
+        return int(device)
+    found = netbox.get("dcim/devices", params={"name": device, "fields": "id,name"})
+    results = found.get("results", []) if isinstance(found, dict) else found
+    if not results:
+        raise ValueError(f"No device named '{device}' in NetBox.")
+    if len(results) > 1:
+        raise ValueError(f"'{device}' matched {len(results)} devices — pass the numeric id.")
+    return results[0]["id"]
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+def netbox_create_inventory_item(
+    device: int | str,
+    name: str,
+    part_id: str | None = None,
+    serial: str | None = None,
+    manufacturer: int | None = None,
+    description: str | None = None,
+    label: str | None = None,
+):
+    """
+    Record a physical part fitted to a device (NetBox inventory item).
+
+    Use this after a part is REPLACED, or to register a known-suspect part, so the
+    history lives with the asset instead of in a ticket that gets closed. Do not
+    bulk-load every DIMM in the fleet — a curated record means "this was replaced or
+    is suspect"; a stale exhaustive inventory is worse than none.
+
+    Args:
+        device: device id, or its exact name (e.g. "server01")
+        name: the slot exactly as the HARDWARE names it — "DIMM_A1",
+              "Disk.Bay.5:Enclosure.Internal.0-1". Matching the SEL / racadm / Redfish
+              naming is what lets these records join up later.
+        part_id: vendor part number, e.g. "M393A4K40BB0-CPB"
+        serial: the serial of THIS unit
+        manufacturer: NetBox manufacturer id (optional)
+        description: free text — put the date, the ticket key and the serial it replaced,
+                     e.g. "fitted 2026-01-15, CHG-1234, replaced S/N ABC12345"
+        label: optional physical label
+
+    Returns:
+        The created inventory item dict (includes its new id).
+    """
+    _assert_writable("dcim.inventoryitem", WRITE_ALLOWED_CREATE, "create")
+    data: dict[str, Any] = {"device": _resolve_device(device), "name": name}
+    for key, value in (
+        ("part_id", part_id),
+        ("serial", serial),
+        ("manufacturer", manufacturer),
+        ("description", description),
+        ("label", label),
+    ):
+        if value is not None:
+            data[key] = value
+    endpoint, _ = _get_endpoint_info("dcim.inventoryitem")
+    return netbox.create(endpoint, data)
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+def netbox_create_journal_entry(
+    object_type: str,
+    object_id: int | str,
+    comments: str,
+    kind: str = "info",
+):
+    """
+    Add a dated journal entry to a NetBox object — the narrative of what happened.
+
+    Pair this with netbox_create_inventory_item: the inventory item is the part that is
+    fitted NOW, the journal entry is the event ("swapped DIMM_A1, CHG-1234, old S/N
+    ABC12345 -> new S/N XYZ67890, fitted by data-center remote hands").
+
+    Args:
+        object_type: the object being journalled, e.g. "dcim.device"
+        object_id: its id, or (for dcim.device) its exact name
+        comments: the entry text. Include the ticket key and old -> new serials.
+        kind: one of "info", "success", "warning", "danger"
+
+    Returns:
+        The created journal entry dict.
+    """
+    _assert_writable("extras.journalentry", WRITE_ALLOWED_CREATE, "create")
+    if kind not in {"info", "success", "warning", "danger"}:
+        raise ValueError('kind must be one of "info", "success", "warning", "danger".')
+    if object_type == "dcim.device":
+        object_id = _resolve_device(object_id)
+    elif not str(object_id).isdigit():
+        raise ValueError(f"object_id must be numeric for {object_type}.")
+    data = {
+        "assigned_object_type": object_type,
+        "assigned_object_id": int(object_id),
+        "kind": kind,
+        "comments": comments,
+    }
+    endpoint, _ = _get_endpoint_info("extras.journalentry")
+    return netbox.create(endpoint, data)
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+def netbox_create_object(object_type: str, data: dict):
+    """
+    Create a NetBox object of a whitelisted type. For the two common part-history objects
+    prefer the purpose-built tools (netbox_create_inventory_item /
+    netbox_create_journal_entry) — they document the expected fields. Use this for the
+    supporting records those need, e.g. a part manufacturer.
+
+    Args:
+        object_type: must be in the create whitelist (see WRITE_ALLOWED_CREATE)
+        data: the object's fields, e.g. {"name": "Samsung"}
+
+    Returns:
+        The created object dict (includes its new id).
+    """
+    _assert_writable(object_type, WRITE_ALLOWED_CREATE, "create")
+    if not isinstance(data, dict) or not data:
+        raise ValueError("data must be a non-empty dict of fields.")
+    # NetBox requires a slug on manufacturers; derive it so callers don't have to.
+    if object_type == "dcim.manufacturer" and "slug" not in data and data.get("name"):
+        slug = "".join(c.lower() if c.isalnum() else "-" for c in str(data["name"]))
+        data = {**data, "slug": "-".join(p for p in slug.split("-") if p)}
+    endpoint, _ = _get_endpoint_info(object_type)
+    return netbox.create(endpoint, data)
+
+
+# PATCH overwrites existing field values, so it is marked destructive.
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True})
+def netbox_update_object(object_type: str, object_id: int, data: dict):
+    """
+    PATCH specific fields of an existing NetBox object. Whitelisted object types only.
+
+    Intended for small corrections in the part-history workflow — fixing a serial,
+    editing a description, adding or clearing a tag such as "part-on-order".
+    Only the keys you pass are changed. There is deliberately NO delete tool.
+
+    Args:
+        object_type: must be in the update whitelist (see WRITE_ALLOWED_UPDATE), e.g.
+                     dcim.device, dcim.inventoryitem, dcim.devicebay
+        object_id: numeric id of the object
+        data: dict of fields to change, e.g. {"serial": "XYZ67890"},
+              {"tags": [{"slug": "part-on-order"}]} or, on a device bay,
+              {"installed_device": 123}
+
+    Returns:
+        The updated object dict.
+    """
+    _assert_writable(object_type, WRITE_ALLOWED_UPDATE, "update")
+    if not isinstance(data, dict) or not data:
+        raise ValueError("data must be a non-empty dict of fields to change.")
+    endpoint, _ = _get_endpoint_info(object_type)
+    return netbox.update(endpoint, int(object_id), data)
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+def netbox_upload_image_attachment(
+    object_type: str,
+    object_id: int | str,
+    file_path: str,
+    name: str | None = None,
+    description: str | None = None,
+):
+    """
+    Attach a local photo to a NetBox object (image attachment).
+
+    Use it for site-visit evidence that should live with the asset: the service-tag
+    pull-out tag, front and rear of a chassis, a module that was pulled. Check the
+    object's existing attachments first (netbox_get_objects 'extras.imageattachment'
+    with object_type/object_id filters) so the same photo is not uploaded twice.
+
+    Args:
+        object_type: one of dcim.device, dcim.rack, dcim.location, dcim.site
+        object_id: its id, or (for dcim.device) its exact name
+        file_path: absolute path to a .png/.jpg/.jpeg/.gif/.webp file, max 25 MB
+        name: caption shown in NetBox, max 50 characters (NetBox's limit),
+              e.g. "Front tag ST ABC1234 (2026-01-15)". It also names the stored file.
+        description: longer free text, e.g. who took it and the ticket key
+
+    Returns:
+        The created image attachment dict (includes its id and image URL).
+    """
+    _assert_writable("extras.imageattachment", WRITE_ALLOWED_CREATE, "create")
+    # NetBox rejects a longer name with a bare 400, and an attachment's name cannot be
+    # fixed afterwards over the API (PATCH returned 500 on NetBox 4.4), so check up front.
+    if name and len(name) > IMAGE_NAME_MAX:
+        raise ValueError(
+            f"name is {len(name)} characters; NetBox allows {IMAGE_NAME_MAX}. "
+            "Put the extra detail in description."
+        )
+    if object_type not in IMAGE_ATTACH_OBJECT_TYPES:
+        raise ValueError(
+            f"Images may only be attached to: {', '.join(sorted(IMAGE_ATTACH_OBJECT_TYPES))}."
+        )
+    if object_type == "dcim.device":
+        object_id = _resolve_device(object_id)
+    elif not str(object_id).isdigit():
+        raise ValueError(f"object_id must be numeric for {object_type}.")
+
+    path = os.path.realpath(os.path.expanduser(file_path))
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in IMAGE_TYPES:
+        raise ValueError(f"Only image files are accepted ({', '.join(sorted(IMAGE_TYPES))}).")
+    if not os.path.isfile(path):
+        raise ValueError(f"No such file: {path}")
+    size = os.path.getsize(path)
+    if size == 0 or size > IMAGE_MAX_BYTES:
+        raise ValueError(f"Image must be 1 byte to {IMAGE_MAX_BYTES // (1024 * 1024)} MB.")
+    mime, magics = IMAGE_TYPES[ext]
+    with open(path, "rb") as fh:
+        head = fh.read(12)
+        if not any(head.startswith(m) for m in magics) or (
+            ext == ".webp" and head[8:12] != b"WEBP"
+        ):
+            raise ValueError(f"{path} does not look like a real {ext} image.")
+        fh.seek(0)
+        endpoint, _ = _get_endpoint_info("extras.imageattachment")
+        data = {"object_type": object_type, "object_id": str(int(object_id))}
+        if name:
+            data["name"] = name
+        if description:
+            data["description"] = description
+        return netbox.upload(endpoint, data, files={"image": (os.path.basename(path), fh, mime)})
+
+
+# ----------------------- end whitelisted write tools -----------------------
 
 
 def _get_endpoint_info(object_type: str) -> tuple[str, str | None]:
